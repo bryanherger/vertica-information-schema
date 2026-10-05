@@ -1,10 +1,14 @@
 -- INFORMATION_SCHEMA DDL for Vertica implementing tables/views from SQL92 spec at https://www.contrib.andrew.cmu.edu/~shadow/sql/sql1992.txt
--- revised for 24.1 and later with support for namespaces (namespace = catalog)
+-- revised for 24.1 and later with support for namespaces (namespace = catalog) and 26.x or later Postgres compatibility (PGcompat)
 DROP SCHEMA IF EXISTS INFORMATION_SCHEMA CASCADE;
--- 21.2.1
-CREATE SCHEMA INFORMATION_SCHEMA;
+DROP SCHEMA IF EXISTS PG_CATALOG CASCADE;
+-- 21.2.1 - BryanH edit 05-Oct-2026 some consumers expect this to be lower-case
+CREATE SCHEMA information_schema;
+-- BryanH edit 05-Oct-2026 some consumers expect this to exist for PGcompat
+CREATE SCHEMA pg_catalog;
 -- 21.2.2, 21.2.3 - Vertica only supports one catalog per database, which we'll call "DEFAULT" here, but TODO, this will change with namespace support
 -- 21.2.4 SCHEMATA
+GRANT USAGE ON SCHEMA INFORMATION_SCHEMA TO PUBLIC;
 CREATE VIEW INFORMATION_SCHEMA.SCHEMATA
               AS SELECT
                   schema_namespace_name AS CATALOG_NAME, SCHEMA_NAME, SCHEMA_OWNER,
@@ -14,11 +18,25 @@ CREATE VIEW INFORMATION_SCHEMA.SCHEMATA
                 FROM V_CATALOG.SCHEMATA;
 -- 21.2.5 DOMAINS - not sure Vertica supports this
 -- 21.2.6 DOMAIN_CONSTRAINTS - not sure Vertica supports this
--- 21.2.7 TABLES
-CREATE VIEW INFORMATION_SCHEMA.TABLES
-              AS SELECT
-                'DEFAULT' AS TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, 'TABLE' AS TABLE_TYPE
-              FROM V_CATALOG.TABLES;
+-- 21.2.7 TABLES - BryanH edit 05-Oct-2026 updated with testing feedback
+CREATE VIEW information_schema.tables AS
+SELECT
+    'DEFAULT' AS table_catalog,
+    table_schema,
+    table_name,
+    'BASE TABLE' AS table_type
+FROM v_catalog.tables
+
+UNION ALL
+
+SELECT
+    'DEFAULT' AS table_catalog,
+    table_schema,
+    table_name,
+    'VIEW' AS table_type
+FROM v_catalog.views;
+
+GRANT SELECT ON information_schema.tables TO PUBLIC;
 -- 21.2.8 VIEWS
 CREATE VIEW INFORMATION_SCHEMA.VIEWS
               AS SELECT
@@ -50,7 +68,7 @@ CREATE VIEW INFORMATION_SCHEMA.COLUMNS
 -- 21.2.10 TABLE_PRIVILEGES
 CREATE VIEW INFORMATION_SCHEMA.TABLE_PRIVILEGES
               AS SELECT
-                GRANTOR, GRANTEE, object_namespace AS TABLE_CATALOG, OBJECT_SCHEMA, OBJECT_NAME,
+                GRANTOR, GRANTEE, 'DEFAULT' AS TABLE_CATALOG, OBJECT_SCHEMA AS TABLE_SCHEMA, OBJECT_NAME AS TABLE_NAME,
                   PRIVILEGES_DESCRIPTION AS PRIVILEGE_TYPE, 'false' AS IS_GRANTABLE
               FROM V_CATALOG.GRANTS
                   WHERE OBJECT_TYPE = 'TABLE' AND (GRANTEE IN ( 'PUBLIC', CURRENT_USER ) OR GRANTOR = CURRENT_USER);
@@ -99,6 +117,117 @@ INSERT INTO INFORMATION_SCHEMA.SQL_LANGUAGES VALUES ('ISO 9075','1999','CORE',''
 -- 21.2.29 CARDINAL_NUMBER domain - not supported
 -- END of 21.2 INFORMATION_SCHEMA
 -- 21.3 DEFINITION_SCHEMA Schema: TODO, but most of these exist in some form in V_CATALOG schema
+-- 21.x ROUTINES - BryanH add 05-Oct-2026 from testing feedback
+CREATE VIEW information_schema.routines AS
+SELECT
+    'DEFAULT' AS specific_catalog,
+    schema_name AS specific_schema,
+    function_name AS specific_name,
+    'DEFAULT' AS routine_catalog,
+    schema_name AS routine_schema,
+    function_name AS routine_name,
+    'FUNCTION' AS routine_type
+FROM v_catalog.user_functions
+
+UNION ALL
+
+SELECT
+    'DEFAULT' AS specific_catalog,
+    schema_name AS specific_schema,
+    procedure_name AS specific_name,
+    'DEFAULT' AS routine_catalog,
+    schema_name AS routine_schema,
+    procedure_name AS routine_name,
+    'PROCEDURE' AS routine_type
+FROM v_catalog.user_procedures;
+-- pg_catalog shim - BryanH add 05-Oct-2026 from testing feedback on PGcompat
+GRANT USAGE ON SCHEMA pg_catalog TO PUBLIC;
+CREATE VIEW pg_catalog.pg_namespace AS
+SELECT
+    schema_id AS oid,
+    schema_name AS nspname
+FROM v_catalog.schemata;
+GRANT SELECT ON pg_catalog.pg_namespace TO PUBLIC;
+CREATE VIEW pg_catalog.pg_class AS
+SELECT
+    table_id AS oid,
+    table_name AS relname,
+    table_schema_id AS relnamespace,
+    'r' AS relkind
+FROM v_catalog.tables
+
+UNION ALL
+
+SELECT
+    table_id AS oid,
+    table_name AS relname,
+    table_schema_id AS relnamespace,
+    'v' AS relkind
+FROM v_catalog.views;
+
+GRANT SELECT ON pg_catalog.pg_class TO PUBLIC;
+CREATE VIEW pg_catalog.pg_attribute AS
+SELECT
+    table_id AS attrelid,
+    column_name AS attname,
+    DENSE_RANK() OVER (
+        ORDER BY LOWER(data_type)
+    ) AS atttypid,
+    ordinal_position AS attnum,
+    NOT is_nullable AS attnotnull
+FROM v_catalog.columns;
+
+GRANT SELECT ON pg_catalog.pg_attribute TO PUBLIC;
+
+CREATE VIEW pg_catalog.pg_type AS
+SELECT
+    DENSE_RANK() OVER (
+        ORDER BY LOWER(data_type)
+    ) AS oid,
+    data_type AS typname
+FROM (
+    SELECT DISTINCT data_type
+    FROM v_catalog.columns
+) types;
+
+GRANT SELECT ON pg_catalog.pg_type TO PUBLIC;
+
+CREATE VIEW pg_catalog.pg_description AS
+SELECT
+    CAST(NULL AS INT) AS objoid,
+    CAST(NULL AS INT) AS objsubid,
+    CAST(NULL AS VARCHAR(65000)) AS description
+WHERE 1 = 0;
+
+GRANT SELECT ON pg_catalog.pg_description TO PUBLIC;
+
+CREATE VIEW pg_catalog.pg_constraint AS
+SELECT
+    tc.constraint_schema_id AS connamespace,
+    tc.table_id AS conrelid,
+    ARRAY[c.ordinal_position] AS conkey,
+    tc.constraint_type AS contype
+FROM v_catalog.table_constraints tc
+JOIN v_catalog.constraint_columns cc
+    ON cc.constraint_id = tc.constraint_id
+JOIN v_catalog.columns c
+    ON c.table_id = cc.table_id
+    AND c.column_name = cc.column_name
+WHERE tc.constraint_type = 'p';
+
+GRANT SELECT ON pg_catalog.pg_constraint TO PUBLIC;
+
+CREATE VIEW pg_catalog.pg_matviews AS
+SELECT
+    CAST(NULL AS VARCHAR(128)) AS schemaname,
+    CAST(NULL AS VARCHAR(128)) AS matviewname,
+    CAST(NULL AS VARCHAR(128)) AS matviewowner,
+    CAST(NULL AS VARCHAR(128)) AS tablespace,
+    CAST(NULL AS BOOLEAN) AS hasindexes,
+    CAST(NULL AS BOOLEAN) AS ispopulated,
+    CAST(NULL AS VARCHAR(65000)) AS definition
+WHERE 1 = 0;
+
+GRANT SELECT ON pg_catalog.pg_matviews TO PUBLIC;
 -- Permissions
-GRANT USAGE ON SCHEMA INFORMATION_SCHEMA TO PUBLIC;
 GRANT SELECT ON ALL TABLES IN SCHEMA INFORMATION_SCHEMA TO PUBLIC;
